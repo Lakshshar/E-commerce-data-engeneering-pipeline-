@@ -1,0 +1,89 @@
+pip install pandas pyodbc
+
+
+
+import pandas as pd
+import pyodbc
+
+# Connections
+source_conn = pyodbc.connect(
+    "DRIVER={SQL Server};SERVER=YOUR_SERVER;DATABASE=ECommerce_OLTP;Trusted_Connection=yes;"
+)
+
+dw_conn = pyodbc.connect(
+    "DRIVER={SQL Server};SERVER=YOUR_SERVER;DATABASE=ECommerce_DW;Trusted_Connection=yes;"
+)
+
+# ---------------- EXTRACT ---------------- #
+
+query = """
+SELECT o.OrderID,
+       o.OrderDate,
+       c.CustomerID,
+       c.CustomerName,
+       c.City,
+       p.ProductID,
+       p.ProductName,
+       p.Category,
+       p.Price,
+       oi.Quantity
+FROM Orders o
+JOIN Customers c ON o.CustomerID = c.CustomerID
+JOIN OrderItems oi ON o.OrderID = oi.OrderID
+JOIN Products p ON oi.ProductID = p.ProductID
+"""
+
+df = pd.read_sql(query, source_conn)
+
+# ---------------- TRANSFORM ---------------- #
+
+df['Revenue'] = df['Price'] * df['Quantity']
+df['Tax'] = df['Revenue'] * 0.18
+df['Profit'] = df['Revenue'] * 0.30
+
+df['DateKey'] = pd.to_datetime(df['OrderDate']).dt.strftime('%Y%m%d').astype(int)
+
+# ---------------- LOAD DIMENSIONS ---------------- #
+
+cursor = dw_conn.cursor()
+
+for _, row in df.iterrows():
+
+    cursor.execute("""
+    IF NOT EXISTS (SELECT 1 FROM DimCustomer WHERE CustomerID = ?)
+    INSERT INTO DimCustomer (CustomerID, CustomerName, City)
+    VALUES (?, ?, ?)
+    """, row.CustomerID, row.CustomerID, row.CustomerName, row.City)
+
+    cursor.execute("""
+    IF NOT EXISTS (SELECT 1 FROM DimProduct WHERE ProductID = ?)
+    INSERT INTO DimProduct (ProductID, ProductName, Category, Price)
+    VALUES (?, ?, ?, ?)
+    """, row.ProductID, row.ProductID, row.ProductName, row.Category, row.Price)
+
+dw_conn.commit()
+
+# ---------------- LOAD FACT TABLE ---------------- #
+
+for _, row in df.iterrows():
+
+    cursor.execute("""
+    INSERT INTO FactSales (CustomerKey, ProductKey, DateKey, Quantity, Revenue, Tax, Profit)
+    SELECT c.CustomerKey, p.ProductKey, ?, ?, ?, ?, ?
+    FROM DimCustomer c, DimProduct p
+    WHERE c.CustomerID = ? AND p.ProductID = ?
+    """,
+    row.DateKey,
+    row.Quantity,
+    row.Revenue,
+    row.Tax,
+    row.Profit,
+    row.CustomerID,
+    row.ProductID)
+
+dw_conn.commit()
+
+print("ETL Process Completed Successfully!")
+
+
+
